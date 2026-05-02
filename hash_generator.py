@@ -471,97 +471,227 @@ class TextHashTab(QWidget):
 class FileHashWorker(QThread):
     progress = pyqtSignal(int)
     result   = pyqtSignal(dict)
+    info     = pyqtSignal(dict)
     error    = pyqtSignal(str)
 
-    def __init__(self, path: str, algos: list):
+    def __init__(self, path: str, is_directory: bool = False):
         super().__init__()
-        self.path  = path
-        self.algos = algos
+        self.path       = path
+        self.is_directory = is_directory
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
-            import os
-            size = os.path.getsize(self.path)
-            hashers = {name: hashlib.new(name.lower().replace("-", "").replace("3", "3_").replace("blake2b","blake2b").replace("blake2s","blake2s"))
-                       for name, _ in self.algos if name not in ("CRC32", "Adler-32")}
-            # Use raw hashlib for standard ones
-            hashers = {}
-            fns = {name: fn for name, fn in self.algos}
-            chunk_hashes: dict[str, list[bytes]] = {name: [] for name in fns}
-
-            crc_val   = 0
-            adler_val = 1
-            md5    = hashlib.md5()
-            sha1   = hashlib.sha1()
-            sha224 = hashlib.sha224()
-            sha256 = hashlib.sha256()
-            sha384 = hashlib.sha384()
-            sha512 = hashlib.sha512()
-            sha3_224 = hashlib.sha3_224()
-            sha3_256 = hashlib.sha3_256()
-            sha3_384 = hashlib.sha3_384()
-            sha3_512 = hashlib.sha3_512()
-            b2b = hashlib.blake2b()
-            b2s = hashlib.blake2s()
-
-            processed = 0
-            CHUNK = 65536
-            with open(self.path, "rb") as f:
-                while True:
-                    chunk = f.read(CHUNK)
-                    if not chunk:
-                        break
-                    md5.update(chunk); sha1.update(chunk); sha224.update(chunk)
-                    sha256.update(chunk); sha384.update(chunk); sha512.update(chunk)
-                    sha3_224.update(chunk); sha3_256.update(chunk)
-                    sha3_384.update(chunk); sha3_512.update(chunk)
-                    b2b.update(chunk); b2s.update(chunk)
-                    crc_val   = zlib.crc32(chunk, crc_val) & 0xFFFFFFFF
-                    adler_val = zlib.adler32(chunk, adler_val) & 0xFFFFFFFF
-                    processed += len(chunk)
-                    if size > 0:
-                        self.progress.emit(int(processed / size * 100))
-
-            result = {
-                "MD5": md5.hexdigest(), "SHA-1": sha1.hexdigest(),
-                "SHA-224": sha224.hexdigest(), "SHA-256": sha256.hexdigest(),
-                "SHA-384": sha384.hexdigest(), "SHA-512": sha512.hexdigest(),
-                "SHA3-224": sha3_224.hexdigest(), "SHA3-256": sha3_256.hexdigest(),
-                "SHA3-384": sha3_384.hexdigest(), "SHA3-512": sha3_512.hexdigest(),
-                "BLAKE2b": b2b.hexdigest(), "BLAKE2s": b2s.hexdigest(),
-                "CRC32": format(crc_val, '08x'),
-                "Adler-32": format(adler_val, '08x'),
-            }
-            self.result.emit(result)
+            if self.is_directory:
+                result = self._hash_directory()
+            else:
+                result = self._hash_file()
+            if not self._cancelled and result:
+                self.result.emit(result)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._cancelled:
+                self.error.emit(str(e))
+
+    def _new_state(self):
+        return {
+            "MD5": hashlib.md5(),
+            "SHA-1": hashlib.sha1(),
+            "SHA-224": hashlib.sha224(),
+            "SHA-256": hashlib.sha256(),
+            "SHA-384": hashlib.sha384(),
+            "SHA-512": hashlib.sha512(),
+            "SHA3-224": hashlib.sha3_224(),
+            "SHA3-256": hashlib.sha3_256(),
+            "SHA3-384": hashlib.sha3_384(),
+            "SHA3-512": hashlib.sha3_512(),
+            "BLAKE2b": hashlib.blake2b(),
+            "BLAKE2s": hashlib.blake2s(),
+            "CRC32": 0,
+            "Adler-32": 1,
+        }
+
+    def _update_state(self, state: dict, chunk: bytes):
+        for algo, value in state.items():
+            if algo in ("CRC32", "Adler-32"):
+                continue
+            value.update(chunk)
+        state["CRC32"] = zlib.crc32(chunk, state["CRC32"]) & 0xFFFFFFFF
+        state["Adler-32"] = zlib.adler32(chunk, state["Adler-32"]) & 0xFFFFFFFF
+
+    def _finish_state(self, state: dict) -> dict:
+        result = {}
+        for algo, value in state.items():
+            if algo == "CRC32":
+                result[algo] = format(value, "08x")
+            elif algo == "Adler-32":
+                result[algo] = format(value, "08x")
+            else:
+                result[algo] = value.hexdigest()
+        return result
+
+    def _hash_file(self) -> dict:
+        import os
+
+        size = os.path.getsize(self.path)
+        state = self._new_state()
+        processed = 0
+        chunk_size = 65536
+
+        with open(self.path, "rb") as f:
+            while True:
+                if self._cancelled:
+                    return {}
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                self._update_state(state, chunk)
+                processed += len(chunk)
+                if size > 0:
+                    self.progress.emit(int(processed / size * 100))
+
+        if size == 0:
+            self.progress.emit(100)
+        return self._finish_state(state)
+
+    def _hash_directory(self) -> dict:
+        import os
+
+        state = self._new_state()
+        entries = []
+        total_bytes = 0
+
+        for root, dirnames, filenames in os.walk(self.path, topdown=True, followlinks=False):
+            if self._cancelled:
+                return {}
+            dirnames.sort()
+            filenames.sort()
+            rel_root = os.path.relpath(root, self.path)
+            if rel_root != ".":
+                entries.append(("dir", rel_root.replace(os.sep, "/"), root, 0))
+            for dirname in dirnames:
+                full = os.path.join(root, dirname)
+                if os.path.islink(full):
+                    rel = os.path.relpath(full, self.path).replace(os.sep, "/")
+                    target = os.readlink(full).encode("utf-8", errors="surrogateescape")
+                    entries.append(("link", rel, full, len(target)))
+                    total_bytes += len(target)
+            for filename in filenames:
+                full = os.path.join(root, filename)
+                rel = os.path.relpath(full, self.path).replace(os.sep, "/")
+                if os.path.islink(full):
+                    target = os.readlink(full).encode("utf-8", errors="surrogateescape")
+                    entries.append(("link", rel, full, len(target)))
+                    total_bytes += len(target)
+                    continue
+                if os.path.isfile(full):
+                    size = os.path.getsize(full)
+                    entries.append(("file", rel, full, size))
+                    total_bytes += size
+
+        entries.sort(key=lambda item: item[1])
+        file_count = sum(1 for kind, *_ in entries if kind == "file")
+        dir_count = sum(1 for kind, *_ in entries if kind == "dir")
+        link_count = sum(1 for kind, *_ in entries if kind == "link")
+        self.info.emit({
+            "files": file_count,
+            "dirs": dir_count,
+            "links": link_count,
+            "bytes": total_bytes,
+        })
+
+        processed = 0
+        chunk_size = 65536
+        self._update_state(state, b"CryptoHashDirectoryV1\0")
+
+        for kind, rel, full, size in entries:
+            if self._cancelled:
+                return {}
+            header = f"{kind}\0{rel}\0{size}\0".encode("utf-8", errors="surrogateescape")
+            self._update_state(state, header)
+            if kind == "file":
+                with open(full, "rb") as f:
+                    while True:
+                        if self._cancelled:
+                            return {}
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        self._update_state(state, chunk)
+                        processed += len(chunk)
+                        if total_bytes > 0:
+                            self.progress.emit(int(processed / total_bytes * 100))
+            elif kind == "link":
+                target = os.readlink(full).encode("utf-8", errors="surrogateescape")
+                self._update_state(state, target)
+                processed += len(target)
+                if total_bytes > 0:
+                    self.progress.emit(int(processed / total_bytes * 100))
+            self._update_state(state, b"\0")
+
+        self.progress.emit(100)
+        return self._finish_state(state)
 
 
 class FileHashTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._worker = None
+        self._worker      = None
+        self._last_result = {}
         self._build_ui()
+        self.setAcceptDrops(True)   # enable drag-and-drop onto the whole tab
 
+    # ── drag-and-drop ──────────────────────────────────────────────────────
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and urls[0].isLocalFile():
+                event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if path:
+                self._hash_path(path)
+
+    # ── UI construction ────────────────────────────────────────────────────
     def _build_ui(self):
         main = QVBoxLayout(self)
         main.setContentsMargins(14, 14, 14, 14)
         main.setSpacing(10)
 
-        # File selector
-        file_group = QGroupBox("FILE")
+        # ── File / directory selector ──
+        file_group = QGroupBox("FILE / DIRECTORY")
         file_layout = QVBoxLayout(file_group)
 
         file_row = QHBoxLayout()
         self.file_edit = QLineEdit()
-        self.file_edit.setPlaceholderText("Select a file to hash…")
+        self.file_edit.setPlaceholderText("Select or drop a file or directory here to hash…")
         self.file_edit.setReadOnly(True)
-        browse_btn = QPushButton("📂 Browse")
-        browse_btn.setObjectName("primary")
-        browse_btn.setFixedWidth(110)
-        browse_btn.clicked.connect(self._browse)
+
+        browse_file_btn = QPushButton("📄 File")
+        browse_file_btn.setObjectName("primary")
+        browse_file_btn.setFixedWidth(90)
+        browse_file_btn.clicked.connect(self._browse_file)
+
+        browse_dir_btn = QPushButton("📂 Folder")
+        browse_dir_btn.setObjectName("primary")
+        browse_dir_btn.setFixedWidth(100)
+        browse_dir_btn.clicked.connect(self._browse_directory)
+
+        self.cancel_btn = QPushButton("✕ Cancel")
+        self.cancel_btn.setObjectName("danger")
+        self.cancel_btn.setFixedWidth(90)
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel)
+
         file_row.addWidget(self.file_edit)
-        file_row.addWidget(browse_btn)
+        file_row.addWidget(browse_file_btn)
+        file_row.addWidget(browse_dir_btn)
+        file_row.addWidget(self.cancel_btn)
         file_layout.addLayout(file_row)
 
         self.file_info_lbl = QLabel("")
@@ -570,12 +700,65 @@ class FileHashTab(QWidget):
 
         main.addWidget(file_group)
 
-        # Progress / status
+        # ── Progress bar + status ──
+        prog_row = QHBoxLayout()
+        from PyQt5.QtWidgets import QProgressBar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(10)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {BG_INPUT};
+                border: 1px solid {BORDER};
+                border-radius: 5px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {ACCENT};
+                border-radius: 5px;
+            }}
+        """)
+        self.progress_bar.setVisible(False)
+
         self.status_lbl = QLabel("No file selected")
         self.status_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
-        main.addWidget(self.status_lbl)
 
-        # Results table
+        prog_row.addWidget(self.progress_bar, 1)
+        prog_row.addWidget(self.status_lbl)
+        main.addLayout(prog_row)
+
+        # ── Verify hash panel ──
+        verify_group = QGroupBox("VERIFY HASH")
+        verify_layout = QHBoxLayout(verify_group)
+        self.verify_edit = QLineEdit()
+        self.verify_edit.setPlaceholderText("Paste a known hash here to verify against computed results…")
+        self.verify_edit.textChanged.connect(self._run_verify)
+        self.verify_result_lbl = QLabel("")
+        self.verify_result_lbl.setFixedWidth(200)
+        self.verify_result_lbl.setAlignment(Qt.AlignCenter)
+        verify_clear = QPushButton("✕")
+        verify_clear.setObjectName("danger")
+        verify_clear.setFixedWidth(30)
+        verify_clear.clicked.connect(lambda: (self.verify_edit.clear(),
+                                               self.verify_result_lbl.setText("")))
+        verify_layout.addWidget(self.verify_edit)
+        verify_layout.addWidget(self.verify_result_lbl)
+        verify_layout.addWidget(verify_clear)
+        main.addWidget(verify_group)
+
+        # ── Results header (options + copy-all) ──
+        results_opts = QHBoxLayout()
+        self.upper_check = QCheckBox("UPPERCASE")
+        self.upper_check.stateChanged.connect(self._apply_uppercase)
+        copy_all_btn = QPushButton("⎘ Copy All Hashes")
+        copy_all_btn.clicked.connect(self._copy_all)
+        results_opts.addWidget(self.upper_check)
+        results_opts.addStretch()
+        results_opts.addWidget(copy_all_btn)
+        main.addLayout(results_opts)
+
+        # ── Hash results scroll area ──
         out_group = QGroupBox("HASH RESULTS")
         out_layout = QVBoxLayout(out_group)
         out_layout.setSpacing(4)
@@ -597,40 +780,163 @@ class FileHashTab(QWidget):
         out_layout.addWidget(scroll)
         main.addWidget(out_group, 1)
 
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select File")
+    # ── File / directory selection and hashing ─────────────────────────────
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select File to Hash")
         if path:
-            self._hash_file(path)
+            self._hash_path(path)
+
+    def _browse_directory(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Directory to Hash")
+        if path:
+            self._hash_path(path)
 
     def _hash_file(self, path: str):
-        import os
+        self._hash_path(path)
+
+    def _hash_path(self, path: str):
+        import os, datetime
+
+        is_directory = os.path.isdir(path)
+
+        # Cancel any in-flight worker
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
+
+        self._last_result = {}
         self.file_edit.setText(path)
-        size = os.path.getsize(path)
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
 
         def fmt_size(n):
-            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-                if n < 1024: return f"{n:.1f} {unit}"
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if n < 1024:
+                    return f"{n:.1f} {unit}"
                 n /= 1024
             return f"{n:.1f} PB"
 
-        name = os.path.basename(path)
-        self.file_info_lbl.setText(f"  {name}  ·  {fmt_size(size)}")
-        self.status_lbl.setText("⏳ Hashing…")
+        if is_directory:
+            self.file_info_lbl.setText(
+                f"  {os.path.basename(path) or path}  ·  Directory  ·  Modified: {mtime}"
+            )
+        else:
+            size = os.path.getsize(path)
+            self.file_info_lbl.setText(
+                f"  {os.path.basename(path)}  ·  {fmt_size(size)}  ·  Modified: {mtime}"
+            )
 
         for row in self._rows.values():
             row.set_hash("")
 
-        self._worker = FileHashWorker(path, HASH_ALGORITHMS)
-        self._worker.progress.connect(lambda p: self.status_lbl.setText(f"⏳ Hashing… {p}%"))
+        self.verify_edit.clear()
+        self.verify_result_lbl.setText("")
+        self.status_lbl.setText("⏳ Scanning directory…" if is_directory else "⏳ Hashing…")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.cancel_btn.setVisible(True)
+
+        self._worker = FileHashWorker(path, is_directory=is_directory)
+        self._worker.info.connect(lambda info: self._on_info(info, path))
+        self._worker.progress.connect(self._on_progress)
         self._worker.result.connect(self._on_result)
-        self._worker.error.connect(lambda e: self.status_lbl.setText(f"❌ Error: {e}"))
+        self._worker.error.connect(self._on_error)
         self._worker.start()
 
+    def _cancel(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
+        self.status_lbl.setText("⚠ Cancelled")
+        self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
+
+    # ── Worker callbacks ───────────────────────────────────────────────────
+    def _on_progress(self, pct: int):
+        self.progress_bar.setValue(pct)
+        self.status_lbl.setText(f"⏳ Hashing… {pct}%")
+
+    def _on_info(self, info: dict, path: str):
+        def fmt_size(n):
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if n < 1024:
+                    return f"{n:.1f} {unit}"
+                n /= 1024
+            return f"{n:.1f} PB"
+
+        import os
+        bits = [
+            f"{info.get('files', 0):,} files",
+            f"{info.get('dirs', 0):,} folders",
+            fmt_size(info.get("bytes", 0)),
+        ]
+        if info.get("links", 0):
+            bits.insert(2, f"{info.get('links', 0):,} links")
+        self.file_info_lbl.setText(f"  {os.path.basename(path) or path}  ·  " + "  ·  ".join(bits))
+
     def _on_result(self, result: dict):
-        self.status_lbl.setText(f"✓ Done")
+        upper = self.upper_check.isChecked()
+        self._last_result = result
         for algo, h in result.items():
             if algo in self._rows:
-                self._rows[algo].set_hash(h)
+                self._rows[algo].set_hash(h.upper() if upper else h)
+        self.status_lbl.setText("✓ Done")
+        self.progress_bar.setValue(100)
+        self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
+        self._run_verify(self.verify_edit.text())
+
+    def _on_error(self, msg: str):
+        self.status_lbl.setText(f"❌ Error: {msg}")
+        self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
+
+    # ── Uppercase toggle ───────────────────────────────────────────────────
+    def _apply_uppercase(self):
+        upper = self.upper_check.isChecked()
+        for algo, h in self._last_result.items():
+            if algo in self._rows:
+                self._rows[algo].set_hash(h.upper() if upper else h)
+
+    # ── Copy all ──────────────────────────────────────────────────────────
+    def _copy_all(self):
+        lines = []
+        for algo, row in self._rows.items():
+            if row._hash_value:
+                lines.append(f"{algo:<12} {row._hash_value}")
+        if lines:
+            QApplication.clipboard().setText("\n".join(lines))
+
+    # ── Verify hash ───────────────────────────────────────────────────────
+    def _run_verify(self, text: str):
+        candidate = text.strip().lower()
+
+        # Reset all row highlights first
+        for row in self._rows.values():
+            row.hash_lbl.setStyleSheet(f"color: {TEXT_HASH};")
+
+        self.verify_result_lbl.setText("")
+        if not candidate or not self._last_result:
+            return
+
+        matched_algo = None
+        for algo, h in self._last_result.items():
+            if h.lower() == candidate:
+                matched_algo = algo
+                break
+
+        if matched_algo:
+            self._rows[matched_algo].hash_lbl.setStyleSheet(
+                f"color: {ACCENT2}; font-weight: bold;"
+            )
+            self.verify_result_lbl.setText(f"✓  {matched_algo}")
+            self.verify_result_lbl.setStyleSheet(
+                f"color: {ACCENT2}; font-weight: bold; font-size: 13px;"
+            )
+        else:
+            self.verify_result_lbl.setText("✗  No match")
+            self.verify_result_lbl.setStyleSheet(
+                f"color: {ACCENT3}; font-weight: bold; font-size: 13px;"
+            )
 
 
 # ── Compare tab ────────────────────────────────────────────────────────────
@@ -814,7 +1120,12 @@ class MainWindow(QMainWindow):
         file_menu = mb.addMenu("File")
         open_act = QAction("Open File…", self)
         open_act.setShortcut("Ctrl+O")
+        open_act.triggered.connect(self._open_file)
         file_menu.addAction(open_act)
+        open_dir_act = QAction("Open Directory…", self)
+        open_dir_act.setShortcut("Ctrl+Shift+O")
+        open_dir_act.triggered.connect(self._open_directory)
+        file_menu.addAction(open_dir_act)
         file_menu.addSeparator()
         quit_act = QAction("Quit", self)
         quit_act.setShortcut("Ctrl+Q")
@@ -865,7 +1176,7 @@ class MainWindow(QMainWindow):
         self.hmac_tab = HmacTab()
 
         self.tabs.addTab(self.text_tab,    "  TEXT HASH  ")
-        self.tabs.addTab(self.file_tab,    "  FILE HASH  ")
+        self.tabs.addTab(self.file_tab,    "  FILE / DIR  ")
         self.tabs.addTab(self.compare_tab, "  COMPARE    ")
         self.tabs.addTab(self.hmac_tab,    "  HMAC       ")
 
@@ -882,7 +1193,20 @@ class MainWindow(QMainWindow):
             "A cryptographic hash generator supporting 14 algorithms.<br><br>"
             "<b>Algorithms:</b> MD5, SHA-1, SHA-224/256/384/512, "
             "SHA3-224/256/384/512, BLAKE2b/s, CRC32, Adler-32<br><br>"
-            "<b>Features:</b> Text hashing, file hashing, hash comparison, HMAC generation")
+            "<b>Features:</b> Text hashing, file and directory hashing, hash comparison, HMAC generation")
+
+    def _open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select File")
+        if path:
+            self.tabs.setCurrentWidget(self.file_tab)
+            self.file_tab._hash_path(path)
+
+    def _open_directory(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if path:
+            self.tabs.setCurrentWidget(self.file_tab)
+            self.file_tab._hash_path(path)
+
 
 
 def main():
