@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QScrollArea, QAction, QMenuBar, QFileDialog, QMessageBox,
     QStatusBar, QToolButton, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QEvent
 from PyQt5.QtGui import (
     QFont, QColor, QPalette, QIcon, QClipboard,
     QSyntaxHighlighter, QTextCharFormat, QFontMetrics
@@ -1111,6 +1111,7 @@ class MainWindow(QMainWindow):
         self.resize(820, 750)
         self.setStyleSheet(STYLESHEET)
         self.setWindowIcon(_get_icon())
+        self._was_maximized_before_fullscreen = False
         self._build_menu()
         self._build_ui()
         self._build_status()
@@ -1131,6 +1132,14 @@ class MainWindow(QMainWindow):
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
+
+        view_menu = mb.addMenu("View")
+        self.fullscreen_act = QAction("Enter Full Screen", self)
+        self.fullscreen_act.setShortcut("F11")
+        self.fullscreen_act.setCheckable(True)
+        self.fullscreen_act.setStatusTip("Toggle full screen mode")
+        self.fullscreen_act.toggled.connect(self._set_fullscreen)
+        view_menu.addAction(self.fullscreen_act)
 
         help_menu = mb.addMenu("Help")
         about_act = QAction("About CryptoHash", self)
@@ -1185,7 +1194,42 @@ class MainWindow(QMainWindow):
     def _build_status(self):
         sb = self.statusBar()
         sb.showMessage(f"  CryptoHash v1.0  ·  {len(HASH_ALGORITHMS)} hash algorithms  ·  "
-                       f"MD5 · SHA-1/256/512 · SHA3 · BLAKE2 · CRC32 · Adler-32  ·  HMAC")
+                       f"MD5 · SHA-1/256/512 · SHA3 · BLAKE2 · CRC32 · Adler-32  ·  HMAC  ·  F11 Full Screen")
+
+    def _set_fullscreen(self, enabled: bool):
+        if enabled == self.isFullScreen():
+            self._sync_fullscreen_action()
+            return
+
+        if enabled:
+            self._was_maximized_before_fullscreen = self.isMaximized()
+            self.showFullScreen()
+        elif self._was_maximized_before_fullscreen:
+            self.showMaximized()
+        else:
+            self.showNormal()
+
+        self._sync_fullscreen_action()
+
+    def _sync_fullscreen_action(self):
+        is_fullscreen = self.isFullScreen()
+        self.fullscreen_act.blockSignals(True)
+        self.fullscreen_act.setChecked(is_fullscreen)
+        self.fullscreen_act.setText("Exit Full Screen" if is_fullscreen else "Enter Full Screen")
+        self.fullscreen_act.setStatusTip("Exit full screen mode" if is_fullscreen else "Enter full screen mode")
+        self.fullscreen_act.blockSignals(False)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self.isFullScreen():
+            self.fullscreen_act.setChecked(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._sync_fullscreen_action()
 
     def _about(self):
         QMessageBox.about(self, "About CryptoHash",
