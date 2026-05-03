@@ -1128,7 +1128,7 @@ class MainWindow(QMainWindow):
         open_dir_act.triggered.connect(self._open_directory)
         file_menu.addAction(open_dir_act)
         file_menu.addSeparator()
-        quit_act = QAction("Quit", self)
+        quit_act = QAction("Exit", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(QApplication.instance().quit)
         file_menu.addAction(quit_act)
@@ -1173,6 +1173,14 @@ class MainWindow(QMainWindow):
         algo_count.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; background-color: {BG_INPUT}; "
                                   f"border: 1px solid {BORDER}; border-radius: 10px; padding: 2px 10px;")
         hlayout.addWidget(algo_count)
+
+        exit_btn = QPushButton("✕ Exit")
+        exit_btn.setObjectName("danger")
+        exit_btn.setFixedWidth(75)
+        exit_btn.setCursor(Qt.PointingHandCursor)
+        exit_btn.clicked.connect(QApplication.instance().quit)
+        hlayout.addWidget(exit_btn)
+
         layout.addWidget(header)
 
         # Tabs
@@ -1195,6 +1203,10 @@ class MainWindow(QMainWindow):
         sb = self.statusBar()
         sb.showMessage(f"  CryptoHash v1.0  ·  {len(HASH_ALGORITHMS)} hash algorithms  ·  "
                        f"MD5 · SHA-1/256/512 · SHA3 · BLAKE2 · CRC32 · Adler-32  ·  HMAC  ·  F11 Full Screen")
+
+    def closeEvent(self, event):
+        QApplication.instance().quit()
+        event.accept()
 
     def _set_fullscreen(self, enabled: bool):
         if enabled == self.isFullScreen():
