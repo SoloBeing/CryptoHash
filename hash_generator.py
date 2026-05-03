@@ -1130,7 +1130,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         quit_act = QAction("Quit", self)
         quit_act.setShortcut("Ctrl+Q")
-        quit_act.triggered.connect(self.close)
+        quit_act.triggered.connect(QApplication.instance().quit)
         file_menu.addAction(quit_act)
 
         view_menu = mb.addMenu("View")
